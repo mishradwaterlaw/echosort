@@ -37,7 +37,7 @@ export default async function RootLayout({
             style={{ color: 'var(--text-primary)' }}
             className="font-semibold text-base tracking-tight hover:opacity-75 transition-opacity"
           >
-            Face<span style={{ color: 'var(--rose)' }}>Find</span>
+            Echo<span style={{ color: 'var(--rose)' }}>Sort</span>
           </Link>
 
           {/* Right: Auth + Theme */}
