@@ -1,4 +1,8 @@
 from pydantic_settings import BaseSettings
+from pathlib import Path
+
+# .env lives one level up at facefind/.env, not inside facefind/api/
+_ENV_FILE = Path(__file__).parent.parent / ".env"
 
 class Settings(BaseSettings):
     supabase_url: str
@@ -8,6 +12,6 @@ class Settings(BaseSettings):
     upstash_redis_token: str
 
     class Config:
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
 
 settings = Settings()
