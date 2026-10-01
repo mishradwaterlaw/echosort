@@ -41,7 +41,7 @@ class MatchRequestResponse(BaseModel):
 class MatchResultResponse(BaseModel):
     request_id: UUID
     status: str
-    photos: List[MatchedPhoto]  # FIX 1: you wrote 'matches' but the contract says 'photos'. Field names are your API's public contract — changing them later is a breaking change for any client consuming this API.
+    photos: List[MatchedPhoto] 
 
 @router.post("/{event_id}/match", response_model=MatchRequestResponse, status_code=status.HTTP_202_ACCEPTED)
 async def request_match(

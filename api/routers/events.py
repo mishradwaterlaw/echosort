@@ -28,8 +28,8 @@ class EventCreateResponse(BaseModel):
 @router.post("", response_model=EventCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_event(
     event: EventCreateRequest,
-    current_user = Depends(get_current_user),        # auth guard — 401 if token invalid
-    supabase: Client = Depends(get_supabase_client)  # db client injected per request
+    current_user = Depends(get_current_user),       
+    supabase: Client = Depends(get_supabase_client)
 ):
     # Step 1: Build insert payload.
     # owner_id comes from the verified JWT user, NOT from the request body —

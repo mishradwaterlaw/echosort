@@ -63,7 +63,7 @@ def process_embedding_job(supabase: Client, job: dict) -> None:
         "storage_path": str
     }
 
-    Q3: Why update status to 'processing' at the start?
+    Q3: Why update status to 'processing' at the start? TODO() make a cronjob for this shit
     A3: If this worker crashes mid-job (OOM, network drop, machine restart),
         any job still showing status='pending' can be safely retried by another
         worker or a future restart. Jobs showing 'processing' that stay stuck
