@@ -1,267 +1,123 @@
 # EchoSort
 
-Event photo sharing with facial recognition. Organizers upload bulk photos from an event. Attendees take a selfie and the system finds every photo they appear in using vector similarity search against ArcFace face embeddings.
+EchoSort is an automated event photo distribution platform powered by facial recognition and vector similarity search.
 
 ---
 
-## What It Does
+## Overview
 
-An event organizer creates a gallery, uploads photos, and shares a link. When an attendee visits the link and submits a selfie, the system runs face detection on the selfie, generates a 512-dimensional embedding using the ArcFace model, and performs a cosine similarity search against all embeddings stored for that event. Matching photos are returned as a signed-URL gallery the attendee can view and download.
+At events such as conferences, weddings, sports meets, and concerts, photographers capture hundreds or thousands of photos. Delivering these photos to the individual attendees who appear in them is a persistent challenge. Attendees are typically left to browse through massive, unsorted galleries, or rely on manual tagging which rarely scales.
 
-The ML pipeline runs asynchronously. Photo uploads are queued via Redis, picked up by a worker, processed through TensorFlow and RetinaFace for detection and ArcFace for embedding, and written to a pgvector index in PostgreSQL. The same queue pattern handles selfie match requests.
+EchoSort resolves this bottleneck through automated facial identification:
+- Event organizers create an event and upload batch photos.
+- An asynchronous machine learning pipeline processes every photo, detects faces, extracts 512-dimensional facial feature embeddings using ArcFace, and indexes them in PostgreSQL using pgvector.
+- Attendees access a dedicated event link, upload or capture a selfie, and the system executes a cosine similarity search against the event's indexed face embeddings.
+- Attendees are immediately served a private, personalized gallery containing every photo in which they appear, delivered via secure time-limited signed URLs.
+
+---
+
+## Key Capabilities
+
+- Automated Face Detection and Feature Extraction: Uses RetinaFace for multi-face detection under varied lighting and orientations, paired with the ArcFace deep neural network to generate discriminative 512-dimensional facial vectors.
+- Approximate Nearest Neighbor (ANN) Search: Employs PostgreSQL with the pgvector extension and Hierarchical Navigable Small World (HNSW) indexing to execute fast cosine distance queries against thousands of face vectors.
+- Asynchronous Task Queue: Decouples long-running ML workloads from user-facing HTTP requests using Redis queues, allowing seamless scaling and preventing request timeouts during batch uploads.
+- Privacy-Conscious Media Delivery: Raw photos and selfies reside in private storage buckets. Matched photos are served exclusively through short-lived signed URLs, avoiding public bucket exposures.
+- Minimal Attendee Friction: Attendees require no account creation or app installation to retrieve their photos; access is provided via a direct event link and selfie submission.
+- Organizer Management: Provides a dashboard for creating events, uploading photo collections with progress feedback, monitoring embedding statuses, and sharing event access links.
+
+---
+
+## System Architecture
+
+```
+Attendee / Organizer
+       |
+       |  HTTPS
+       v
+Next.js Frontend (Vercel)
+       |
+       |  REST API (JSON / Bearer Token)
+       v
+FastAPI Backend (Render)
+       |
+       +---> Upstash Redis (Task Queue: LPUSH / RPOP)
+       |        |
+       |        v
+       |     ML Worker (Modal / Serverless)
+       |        |  - RetinaFace (Detection)
+       |        |  - ArcFace (512d Embedding)
+       |        v
+       +---> Supabase PostgreSQL (pgvector HNSW index)
+       +---> Supabase Storage (Private Media Buckets)
+```
+
+---
+
+## How It Works
+
+### 1. Photo Ingestion and Indexing
+1. The organizer creates an event and uploads bulk photos via the web interface.
+2. The FastAPI service receives the files, stores them in Supabase Storage, creates records in the database with status `pending`, and pushes jobs to the Redis queue.
+3. The background ML worker polls the queue, downloads each image, runs RetinaFace to crop detected faces, and generates an ArcFace embedding vector for each face.
+4. Extracted embeddings and bounding confidence values are inserted into the `face_embeddings` table and linked to the photo record.
+5. The photo status is updated to `done`.
+
+### 2. Attendee Discovery and Matching
+1. The attendee opens the event link and captures a selfie using their device camera or file selector.
+2. The selfie is submitted to the API, which records a match request and enqueues a matching job.
+3. The ML worker extracts the facial embedding of the selfie.
+4. A PostgreSQL RPC function executes an HNSW-indexed cosine similarity query against all face embeddings associated with that specific event, filtering by a strict similarity threshold.
+5. Distinct matching photo IDs are saved to the match request, and the frontend displays the matched gallery with signed URLs for viewing and downloading.
 
 ---
 
 ## Tech Stack
 
-**Frontend**
-- Next.js 14 with App Router and TypeScript
-- Supabase Auth with server-side session management
-- Server Components for data fetching, Client Components for interactivity
-- Server Actions for credential handling without exposing tokens to the browser
-- Hosted on Vercel
-
-**Backend**
-- FastAPI with Python
-- Pydantic Settings for environment validation
-- Supabase Python client with service role key for RLS bypass
-- Upstash Redis for job queuing (LPUSH/RPOP FIFO pattern)
-- Hosted on Render
-
-**ML Worker**
-- DeepFace with ArcFace model for 512-dimensional face embeddings
-- RetinaFace for face detection
-- TensorFlow CPU runtime
-- Modal.com for serverless GPU execution in production
-- Runs as a polling worker consuming jobs from Redis
-
-**Database and Storage**
-- Supabase PostgreSQL with pgvector extension
-- HNSW index on face embeddings for approximate nearest neighbor search
-- Postgres RPC function for cosine similarity queries with threshold filtering
-- Row Level Security policies on all tables
-- Supabase Storage with private buckets and time-limited signed URLs
+- Frontend: Next.js 14 (App Router), React, TypeScript, Tailwind CSS
+- Backend API: FastAPI, Python, Pydantic, HTTPX
+- ML Pipeline: DeepFace, ArcFace, RetinaFace, TensorFlow
+- Vector Database: Supabase PostgreSQL with pgvector (HNSW cosine similarity index)
+- Task Queue: Upstash Redis
+- Object Storage: Supabase Storage (private buckets with time-limited signed URLs)
+- Authentication: Supabase Auth with server-side session verification
 
 ---
 
-## Architecture
-
-```
-Browser
-  |
-  | HTTP
-  v
-Next.js (Vercel)
-  |
-  | REST API calls with JWT
-  v
-FastAPI (Render)
-  |            |
-  |            | LPUSH job
-  |            v
-  |         Upstash Redis
-  |            |
-  |            | RPOP job
-  |            v
-  |         ML Worker (Modal)
-  |            |
-  |            | INSERT embeddings
-  |            v
-  +---------> Supabase PostgreSQL + pgvector
-              Supabase Storage (private buckets)
-```
-
----
-
-## Project Structure
+## Repository Structure
 
 ```
 echosort/
-  api/
-    main.py                         FastAPI app with CORS and router registration
-    config.py                       Pydantic Settings environment validation
-    dependencies.py                 JWT auth guard and cached Supabase client
-    routers/
-      events.py                     CRUD for events
-      photos.py                     Bulk photo upload and status polling
-      matches.py                    Selfie upload and match result retrieval
-  ml_worker/
-    embedder.py                     ArcFace embedding logic and cosine similarity
-    job_runner.py                   Redis polling worker with state machine
-    modal_app.py                    Modal.com deployment configuration
-    tests/
-      test_embedder.py              Unit tests for embedding pipeline
-  frontend/
-    src/
-      app/
-        dashboard/                  Organizer event management
-        events/[eventId]/           Event detail and photo upload
-        find/[eventId]/             Attendee selfie capture
-        find/[eventId]/results/     Matched photo gallery with polling
-        (auth)/                     Login and signup pages
-        auth/callback/              Supabase OAuth callback handler
-      components/
-        PhotoUploader.tsx           XHR-based uploader with per-file progress
-        SelfieCapture.tsx           Webcam capture and file fallback
-        PollResultsClient.tsx       Headless polling component
-        CreateEventForm.tsx         Server Action form
-      lib/supabase/
-        client.ts                   Browser Supabase client
-        server.ts                   Server-side Supabase client with cookies
-  supabase/
-    migrations/
-      001_initial.sql               Full schema with extensions, indexes, RLS
+  api/                  FastAPI backend service and endpoint routers
+    routers/            Route definitions for events, photos, and match requests
+    config.py           Environment configuration and validation
+    dependencies.py     Authentication guards and database clients
+  frontend/             Next.js 14 web application
+    src/app/            App router pages (dashboard, event upload, selfie matching)
+    src/components/     Reusable UI components (uploader, camera capture, galleries)
+    src/lib/            Supabase clients and utility functions
+  ml_worker/            Asynchronous machine learning pipeline
+    embedder.py         Face detection and embedding generation logic
+    job_runner.py       Redis queue consumer and job execution lifecycle
+    modal_app.py        Serverless deployment configuration
+  supabase/             Database migrations and SQL schema definitions
+    migrations/         pgvector schema, tables, RPC functions, and RLS policies
+  docs/                 Detailed system architecture, critique, and technical notes
 ```
 
 ---
 
-## Database Schema
+## Documentation
 
-```
-events
-  id uuid PK
-  owner_id uuid FK auth.users
-  name text
-  description text
-  event_date date
-  is_active boolean
-  created_at timestamptz
-
-photos
-  id uuid PK
-  event_id uuid FK events
-  storage_path text
-  uploaded_by uuid
-  embedding_status text CHECK (pending, processing, done, failed)
-  created_at timestamptz
-  updated_at timestamptz (moddatetime trigger)
-
-face_embeddings
-  id uuid PK
-  photo_id uuid FK photos
-  event_id uuid FK events
-  embedding vector(512)
-  confidence float
-  created_at timestamptz
-
-match_requests
-  id uuid PK
-  user_id uuid FK auth.users
-  event_id uuid FK events
-  selfie_path text
-  status text CHECK (pending, processing, done, failed)
-  result_photo_ids uuid[]
-  created_at timestamptz
-```
+In-depth technical and architectural documentation can be found in the `docs` directory:
+- System Architecture: [docs/SYSTEM_ARCHITECTURE.md](docs/SYSTEM_ARCHITECTURE.md)
+- Architectural Critique and Analysis: [docs/ARCHITECTURAL_CRITIQUE.md](docs/ARCHITECTURAL_CRITIQUE.md)
+- Technical Discussion and Design Rationale: [docs/INTERVIEW_PREP.md](docs/INTERVIEW_PREP.md)
 
 ---
 
-## Key Implementation Details
+## Setup and Installation
 
-**Why XHR instead of fetch for photo uploads**
-The Fetch API does not expose upload progress events. XHR provides xhr.upload.onprogress which enables per-file progress bars.
-
-**Why sequential uploads instead of parallel**
-Sequential uploads give accurate per-file completion state in the UI and avoid saturating the connection on mobile networks.
-
-**Why the ML worker uses a polling loop instead of webhooks**
-The worker runs on Modal as a serverless function without a persistent HTTP endpoint. Redis gives a persistent queue that survives worker restarts.
-
-**Why embeddings use cosine similarity instead of Euclidean distance**
-ArcFace embeddings are trained with angular margin loss. Cosine similarity over the unit-normalized output vectors is the correct distance metric for this model family.
-
-**Why Server Actions handle tokens instead of props**
-Passing a JWT as a React prop would serialize it into the browser bundle or client-side state. Server Actions keep credentials on the server and expose only a callable function reference to the client.
-
-**Why getUser() instead of getSession() for server-side auth checks**
-getSession() reads from the cookie without cryptographic verification. getUser() makes a network call to Supabase to verify the token. All server-side auth guards use getUser().
-
----
-
-## Local Development
-
-Prerequisites: Python 3.10, Node.js 18+, pyenv
-
-**Backend**
-
-```bash
-cd api
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
-```
-
-**ML Worker**
-
-```bash
-cd ml_worker
-pip install deepface retina-face tensorflow supabase upstash-redis numpy opencv-python-headless python-dotenv
-python job_runner.py
-```
-
-**Frontend**
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-**Environment variables required**
-
-For the API and ML worker, create a .env file in the project root:
-
-```
-SUPABASE_URL=
-SUPABASE_ANON_KEY=
-SUPABASE_SERVICE_ROLE_KEY=
-UPSTASH_REDIS_URL=
-UPSTASH_REDIS_TOKEN=
-```
-
-For the frontend, create frontend/.env.local:
-
-```
-NEXT_PUBLIC_SUPABASE_URL=
-NEXT_PUBLIC_SUPABASE_ANON_KEY=
-NEXT_PUBLIC_API_URL=http://localhost:8000
-NEXT_PUBLIC_APP_URL=http://localhost:3000
-```
-
----
-
-## Deployment
-
-**Supabase**: Run migrations in the SQL editor. Enable pgvector and moddatetime extensions. Configure Auth redirect URLs. Create photos and selfies storage buckets as private.
-
-**Upstash**: Create a Redis database. Copy the REST URL and token to environment variables. Remove any quotes from the URL value.
-
-**Render**: Connect the GitHub repository. Set the root directory to api. Add all environment variables from .env. The service starts with uvicorn main:app --host 0.0.0.0 --port 10000.
-
-**Modal**: Authenticate with modal token new. Deploy with modal deploy ml_worker/modal_app.py. Add secrets via the Modal dashboard under the facefind-secrets group.
-
-**Vercel**: Import the GitHub repository. Set the root directory to frontend. Add all NEXT_PUBLIC environment variables plus update NEXT_PUBLIC_API_URL to the Render service URL.
-
----
-
-## Supabase Setup Notes
-
-Run this SQL before the application migrations:
-
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS moddatetime SCHEMA extensions;
-```
-
-The photos table requires an updated_at column added manually if not present in the initial migration:
-
-```sql
-ALTER TABLE photos ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
-
-CREATE TRIGGER handle_photos_updated_at
-BEFORE UPDATE ON photos
-FOR EACH ROW
-EXECUTE FUNCTION moddatetime(updated_at);
-```
+Environment setup, local configuration guidelines, and deployment instructions are currently pending and will be documented in a future update.
 
 ---
 

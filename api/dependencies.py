@@ -1,23 +1,63 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from functools import lru_cache
 from supabase import create_client, Client
+from upstash_redis import Redis
 from config import settings
 
 security = HTTPBearer()
 
+@lru_cache(maxsize=1)
 def get_supabase_client() -> Client:
-    # Q3: Why is the client itself a dependency?
-    # Because it makes routes testable — in tests you can swap this out
-    # with a mock client using FastAPI's dependency_overrides. It also
-    # ensures one clean client instance per request rather than a global.
-    #
-    # Q1: Why service_role_key and not anon_key?
-    # The anon_key respects Row Level Security (RLS) — it can only see
-    # data the logged-out public is allowed to see. The service_role_key
-    # bypasses RLS entirely and can validate any user's JWT server-side.
-    # This is safe here because this code only runs on YOUR server, never
-    # in the browser.
+    """
+    Singleton Supabase client with connection pooling, shared across requests.
+
+    Q: Why use @lru_cache(maxsize=1) here instead of creating a client per request?
+    A: 1. Connection Reuse (HTTP Keep-Alive): create_client() initializes an internal
+          HTTP transport session. Creating a new client on every single incoming HTTP
+          request forces python to re-establish TCP handshakes and TLS negotiations with
+          Supabase for every query. A cached singleton keeps connections alive in a pool.
+       2. Memory & GC Pressure: Instantiating client objects on every request causes
+          continual allocation and garbage collection churn under load.
+       3. Testability Preserved: Even with @lru_cache, FastAPI's dependency injection
+          system (app.dependency_overrides[get_supabase_client] = mock_client) can still
+          override this function during automated tests.
+
+    Q: Why service_role_key and not anon_key?
+    A: The anon_key respects Row Level Security (RLS) — it can only see data the
+       public or authenticated user is permitted to see. The service_role_key bypasses
+       RLS entirely, allowing the backend server to manage events, store embeddings,
+       and validate user JWTs. This key NEVER leaves the backend environment.
+    """
     return create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+@lru_cache(maxsize=1)
+def get_redis_client() -> Redis:
+    """
+    Singleton Redis client, shared across ALL routers.
+
+    Q: Why @lru_cache here instead of defining this inside each router?
+    A: @lru_cache caches the return value per function OBJECT in memory.
+       If two routers define their own get_redis_client(), each function
+       has its own cache entry — so you get TWO separate Redis clients,
+       each with their own HTTP session pool. By defining it once here
+       and importing the same function everywhere, all routers share
+       the exact same cached client instance.
+
+    Q: Why not just make it a module-level global variable?
+    A: Two reasons:
+       1. Lazy initialization — the client is only created the first time
+          it's actually called, not at import time. If Redis is unavailable
+          at startup, the error surfaces on the first request (with context)
+          rather than silently crashing the entire process at import.
+       2. Testability — tests can call lru_cache.cache_clear() to force
+          a fresh client to be created, or mock the function with
+          dependency_overrides in FastAPI's test client.
+    """
+    return Redis(
+        url=settings.upstash_redis_url,
+        token=settings.upstash_redis_token
+    )
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),

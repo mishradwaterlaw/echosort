@@ -19,5 +19,4 @@ app.add_middleware(
 # Register routers with their URL prefixes
 app.include_router(events.router, prefix="/events", tags=["events"])
 app.include_router(photos.router, prefix="/events", tags=["photos"])
-app.include_router(matches.router, prefix="/events", tags=["matches"])  # POST /{event_id}/match
-app.include_router(matches.router, prefix="/matches", tags=["matches-get"])  # GET /{request_id}
+app.include_router(matches.router, prefix="/matches", tags=["matches"])

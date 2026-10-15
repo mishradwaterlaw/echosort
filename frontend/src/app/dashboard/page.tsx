@@ -38,11 +38,19 @@ async function createEventAction(body: object) {
 
 export default async function DashboardPage() {
   const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) redirect('/login')
 
+  // Single auth call: getSession() extracts the session directly from request cookies in memory.
+  // Why not call both getUser() and getSession()?
+  // 1. getUser() makes an external HTTPS network call to Supabase Auth servers (/auth/v1/user).
+  // 2. getSession() reads and parses the cookie locally (0ms network latency).
+  // 3. Calling both causes a redundant network hop on every page render.
+  // 4. Security note: Our downstream FastAPI backend (GET /events) independently verifies
+  //    the access_token cryptographically via Supabase Auth in get_current_user. If the
+  //    cookie was tampered with, FastAPI rejects it with 401 Unauthorized immediately.
   const { data: { session } } = await supabase.auth.getSession()
-  const token = session?.access_token
+  if (!session?.user) redirect('/login')
+
+  const token = session.access_token
 
   let events: Event[] = []
   let fetchError: string | null = null

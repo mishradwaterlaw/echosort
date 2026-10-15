@@ -20,20 +20,20 @@ export default async function MatchResultsPage({
 }) {
   const { eventId, requestId } = await params
   
-  // Requirement 1: Auth guard
+  // Requirement 1: Auth guard & token retrieval
+  // Single auth call: getSession() extracts session and token from cookies in memory.
+  // We avoid duplicate getUser() network hops because the token is validated downstream
+  // by FastAPI's get_current_user dependency.
   const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) redirect('/login')
-
   const { data: { session } } = await supabase.auth.getSession()
-  const token = session?.access_token
+  if (!session?.user) redirect('/login')
+  const token = session.access_token
 
-  // Server Action
+  // Server Action: Called by PollResultsClient inside the 3s polling loop.
+  // Using getSession() avoids making an outbound HTTPS call to Supabase on every poll tick.
   async function getToken() {
     'use server'
     const authSupa = await createClient()
-    const { data: { user } } = await authSupa.auth.getUser()
-    if (!user) return undefined
     const { data: { session } } = await authSupa.auth.getSession()
     return session?.access_token
   }

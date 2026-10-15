@@ -1,45 +1,65 @@
+"""
+EchoSort Cloud ML Worker (Modal Serverless)
+===========================================
+Engine: InsightFace + ONNX Runtime on CPU
+Architecture:
+  - Container Image: Python 3.10 slim + compiled C++ ONNX Runtime
+  - Pre-warmed Models: SCRFD-10G (detector) + ArcFace ResNet50 (embedder) baked into image
+  - Schedule: Periodic wake-up (every 30s) or on-demand trigger
+  - Priority Queue: Drains interactive match_jobs (attendee waiting) BEFORE bulk embedding_jobs
+"""
+
 import modal
 
-# Step 1: Define the container image
-# We pre-download models during the image build phase to avoid
-# multi-gigabyte downloads every time the worker starts.
+# Step 1: Pre-warm models during Docker build phase
 def download_models():
-    from deepface import DeepFace
-    # Pre-load the ArcFace recognition model weights into the image.
-    # RetinaFace is a detector (not a recognition model) — it does not use
-    # DeepFace.build_model() and will auto-download its weights on first use.
-    DeepFace.build_model("ArcFace")
+    """
+    Downloads and compiles InsightFace ONNX models during image build.
+    This guarantees zero cold-start network downloads at runtime.
+    """
+    import numpy as np
+    from insightface.app import FaceAnalysis
 
+    print("Pre-warming InsightFace buffalo_l (SCRFD + ArcFace) into container...")
+    app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    app.prepare(ctx_id=-1, det_size=(640, 640))
+
+    # Run inference on a blank dummy frame to compile the ONNX execution graph
+    dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
+    app.get(dummy_img)
+    print("InsightFace models successfully cached in /root/.insightface!")
+
+
+# Step 2: Define container image without bloated TensorFlow/GPU packages
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install(
-        "libgl1",          # Provides libGL.so.1 — required by opencv-python-headless
-        "libglib2.0-0",    # Required by certain OpenCV functions
+        "libgl1",          # Required by opencv-python-headless
+        "libglib2.0-0",    # Required by image codecs
     )
     .pip_install(
-        "deepface",
-        "retina-face",
+        "insightface",
+        "onnxruntime",     # High-speed C++ CPU vector inference (AVX-512)
         "supabase",
         "upstash-redis",
         "numpy",
         "opencv-python-headless",
         "python-dotenv",
-        "tf-keras",
-        "tensorflow", # Ensure tensorflow is present for deepface
     )
     .run_function(download_models)
     .add_local_file("job_runner.py", "/root/job_runner.py")
     .add_local_file("embedder.py", "/root/embedder.py")
 )
 
-app = modal.App("facefind-worker", image=image)
+app = modal.App("echosort-worker", image=image)
 secrets = [modal.Secret.from_name("facefind-secrets")]
 
+
 @app.function(
-    gpu="T4",
+    cpu=2.0,            # Efficient 2-core CPU container (No expensive GPU needed!)
+    memory=1024,        # Only 1GB RAM needed (TensorFlow needed 4GB+)
     secrets=secrets,
     timeout=600,
-    retries=2,
     schedule=modal.Period(seconds=30),
 )
 def process_jobs():
@@ -48,10 +68,9 @@ def process_jobs():
     from supabase import create_client
     from upstash_redis import Redis
     
-    # These are in /root/ thanks to .add_local_file in the image definition above
     from job_runner import (
-        process_embedding_job,
-        process_match_job,
+        init_stream_groups,
+        drain_stream_priority,
         validate_env,
     )
 
@@ -66,25 +85,13 @@ def process_jobs():
         token=os.environ["UPSTASH_REDIS_TOKEN"],
     )
 
-    # Drain embedding_jobs
-    while True:
-        job = redis.rpop("embedding_jobs")
-        if not job:
-            break
-        try:
-            process_embedding_job(supabase, json.loads(job))
-        except Exception as e:
-            print(f"Embedding job failed: {e}")
+    # Ensure consumer groups are initialized
+    init_stream_groups(redis)
 
-    # Drain match_jobs
-    while True:
-        job = redis.rpop("match_jobs")
-        if not job:
-            break
-        try:
-            process_match_job(supabase, json.loads(job))
-        except Exception as e:
-            print(f"Match job failed: {e}")
+    # Drain streams with crash-recovery (XAUTOCLAIM) and priority queueing
+    while drain_stream_priority(supabase, redis):
+        pass
+
 
 @app.local_entrypoint()
 def main():

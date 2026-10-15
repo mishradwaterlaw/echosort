@@ -14,8 +14,6 @@
 import json
 import uuid
 import logging
-from functools import lru_cache
-from upstash_redis import Redis
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from pydantic import BaseModel
@@ -24,7 +22,7 @@ from datetime import datetime
 from typing import Optional, List
 
 from supabase import Client
-from dependencies import get_current_user, get_supabase_client
+from dependencies import get_current_user, get_supabase_client, get_redis_client
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -32,12 +30,6 @@ logger = logging.getLogger(__name__)
 ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_FILE_SIZE = 15 * 1024 * 1024  # 15MB
 
-@lru_cache(maxsize=1)
-def get_redis_client() -> Redis:
-    return Redis(
-        url=settings.upstash_redis_url,
-        token=settings.upstash_redis_token
-    )
 
 router = APIRouter()
 
@@ -136,13 +128,14 @@ async def upload_photos(
                 skipped.append(f"{file.filename} (database error)")
                 continue # Skip to next file if DB insertion failed but storage upload succeeded (leaves orphan, but API won't break for rest of files)
 
-            # Step 2e: Push job to Redis
+            # Step 2e: Append job to Redis Stream
             job = {
                 "photo_id": str(photo_id), 
                 "event_id": str(event_id), 
                 "storage_path": storage_path
             }
-            get_redis_client().lpush("embedding_jobs", json.dumps(job))
+            # xadd creates an immutable log entry with an auto-generated timestamp ID
+            get_redis_client().xadd("stream:embedding_jobs", {"payload": json.dumps(job)})
 
             # Step 2f: Increment accepted counter and append photo_id
             accepted += 1

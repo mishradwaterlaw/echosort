@@ -171,7 +171,7 @@ FastAPI Router Tree:
      - Generates UUID `photo_id = uuid.uuid4()`.
      - Uploads bytes to Supabase Storage bucket `'photos'` at path `"{event_id}/{photo_id}"`.
      - Inserts row into `photos` table with `embedding_status = "pending"`.
-     - Pushes job JSON to Upstash Redis list `"embedding_jobs"`.
+     - Appends job JSON to Upstash Redis Stream `"stream:embedding_jobs"` via `XADD`.
 - **Target:** **Both Postgres (Storage + DB) AND Redis.**
 
 #### 5. `GET /events/{event_id}/photos`
@@ -209,17 +209,14 @@ FastAPI Router Tree:
      - Returns photo IDs with 1-hour signed URLs.
 - **Target:** **Postgres directly.**
 
-> [!WARNING]
-> **Routing Prefix Gotcha:**  
-> In [`api/main.py:22-23`](file:///d:/langgraph-proj/echosort/api/main.py#L22-L23), `matches.router` is included twice:
+> [!NOTE]
+> **Correct Route Registration:**  
+> In [`api/main.py`](file:///d:/langgraph-proj/echosort/api/main.py), the matches router is registered with prefix `/matches`:
 > ```python
-> app.include_router(matches.router, prefix="/events", tags=["matches"])
-> app.include_router(matches.router, prefix="/matches", tags=["matches-get"])
+> app.include_router(matches.router, prefix="/matches", tags=["matches"])
 > ```
-> Inside `matches.py`, the endpoint is `@router.get("/matches/{request_id}")`.  
-> - Under `/events`: `GET /events/matches/{request_id}`  
-> - Under `/matches`: `GET /matches/matches/{request_id}` (doubled prefix)  
-> The frontend client in [`PollResultsClient.tsx:27`](file:///d:/langgraph-proj/echosort/frontend/src/app/find/%5BeventId%5D/results/%5BrequestId%5D/PollResultsClient.tsx#L27) works around this by targeting `/events/matches/{requestId}`.
+> Inside `matches.py`, the endpoint is `@router.get("/{request_id}")` — so the full URL is `GET /matches/{request_id}`.  
+> The frontend polls exactly `${apiUrl}/matches/${requestId}` — correct.
 
 ---
 
@@ -235,26 +232,28 @@ FastAPI Router Tree:
 │  - Reads image bytes into memory                            │
 │  - Sequentially uploads bytes to Supabase Storage: 'photos' │
 │  - INSERT photos (embedding_status = 'pending')             │
-│  - LPUSH 'embedding_jobs' to Upstash Redis                  │
+│  - XADD stream:embedding_jobs {payload: json}               │
 │  - Returns 202 Accepted                                     │
 └─────────────────────────────────────────────────────────────┘
        │
-       ▼ 2. LPUSH JSON {photo_id, event_id, storage_path}
+       ▼ 2. XADD immutable log entry (timestamp ID auto-generated)
 ┌─────────────────────────────────────────────────────────────┐
-│ Upstash Redis ('embedding_jobs')                            │
+│ Upstash Redis Stream ('stream:embedding_jobs')              │
+│  Consumer Group: 'echosort_workers'                         │
 └─────────────────────────────────────────────────────────────┘
        │
-       ▼ 3. RPOP JSON (Worker Polling Loop)
+       ▼ 3. XREADGROUP (Worker reads unacked messages)
 ┌─────────────────────────────────────────────────────────────┐
-│ ML Worker (Modal GPU or Python job_runner.py)               │
+│ ML Worker (Modal CPU or Python job_runner.py)               │
 │  - UPDATE photos SET embedding_status = 'processing'        │
 │  - Download raw image bytes from Supabase Storage           │
 │  - cv2.imdecode(bytes) -> numpy BGR array                   │
-│  - DeepFace.represent(ArcFace, RetinaFace)                  │
-│  - Filter faces with confidence > 0.5                       │
-│  - Convert 512D numpy array to native float list            │
+│  - InsightFace buffalo_l (SCRFD detector + ArcFace ResNet50)│
+│  - Filter faces with det_score > 0.5                        │
+│  - normed_embedding.tolist() → 512D unit-normalized vector  │
 │  - INSERT INTO face_embeddings (photo_id, embedding, ...)   │
 │  - UPDATE photos SET embedding_status = 'done'              │
+│  - XACK stream:embedding_jobs (removes from PEL)            │
 └─────────────────────────────────────────────────────────────┘
        │
        ▼ 4. Rows written to face_embeddings
@@ -266,32 +265,38 @@ FastAPI Router Tree:
 The FastAPI handler only handles file ingestion, storage persistence, and queuing.
 
 ### The Actual Embedding Generation Code
-From [`ml_worker/embedder.py:28-53`](file:///d:/langgraph-proj/echosort/ml_worker/embedder.py#L28-L53):
+From [`ml_worker/embedder.py:27-101`](file:///d:/langgraph-proj/echosort/ml_worker/embedder.py#L27-L101):
 
 ```python
-results = DeepFace.represent(
-    img_path=img_path_or_array,
-    model_name="ArcFace",
-    detector_backend="retinaface",
-    enforce_detection=False
-)
+@lru_cache(maxsize=1)
+def get_face_analyzer() -> FaceAnalysis:
+    """Singleton factory — loads ONNX graph exactly ONCE per process."""
+    app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    app.prepare(ctx_id=-1, det_size=(640, 640))
+    return app
 
-valid_faces = []
-for face_data in results:
-    confidence = face_data.get("face_confidence", 0)
-    if confidence > 0.5:
-        if len(face_data["embedding"]) != VECTOR_DIMENSIONS:
-            logger.warning(f"Unexpected embedding size: {len(face_data['embedding'])}, expected {VECTOR_DIMENSIONS}. Skipping.")
-            continue
-            
-        valid_faces.append({
-            "embedding": face_data["embedding"],
-            "facial_area": face_data["facial_area"],
-            "confidence": confidence
-        })
+# Inside get_faces_and_embeddings():
+analyzer = get_face_analyzer()   # cached — no reload on subsequent calls
+raw_faces = analyzer.get(img)    # runs SCRFD detector then ArcFace embedder
 
-return valid_faces
+for face in raw_faces:
+    confidence = float(face.det_score)
+    if confidence < 0.5:
+        continue
+    # normed_embedding is strictly unit-normalized (|v| = 1.0)
+    # perfect for pgvector cosine distance (<=>)
+    embedding_vector = face.normed_embedding.tolist()  # 512 floats
+    valid_faces.append({
+        "embedding": embedding_vector,
+        "facial_area": {"x": x1, "y": y1, "w": width, "h": height},
+        "confidence": confidence,
+    })
 ```
+
+**Why InsightFace over DeepFace?**  
+- DeepFace wraps TensorFlow → 4GB+ RAM, GPU optimal, slow CPU cold-start.  
+- InsightFace uses ONNX Runtime (compiled C++) → ~100MB RAM, 30–50ms/image on 2-core CPU, AVX-512 SIMD acceleration.  
+- `normed_embedding` is already unit-normalized → cosine similarity = dot product → perfect for pgvector's `<=>` operator.
 
 ### Architectural Critique: Is the API Non-Blocking?
 **No, the API is partially blocking during uploads.**  
@@ -300,22 +305,32 @@ In `photos.py`, the endpoint sequentially reads file bytes into memory and perfo
 
 ---
 
-## 4. Redis Job Queue
+## 4. Redis Streams (Job Queue)
+
+### Why Redis Streams, not a plain List (LPUSH/RPOP)?
+
+The old LPUSH/RPOP approach had a fatal flaw: **`RPOP` is a destructive pop**. The moment a worker reads a job, it is permanently deleted from Redis. If the worker crashes (OOM kill, container restart, network drop) after popping but before finishing, **the job is silently gone forever** — the DB row stays stranded at `'processing'` with no recovery path.
+
+Redis Streams solve this with the **Pending Entries List (PEL)**: a message moves to a consumer's PEL on `XREADGROUP` and only leaves the PEL when the consumer explicitly `XACK`s it. If the worker dies, the message stays in the PEL. Any surviving worker can call `XAUTOCLAIM` to reclaim it.
 
 ### Commands & Implementation
-- **Client Library:** `upstash_redis` (`from upstash_redis import Redis`)
-  - Communicates via HTTP/REST endpoints rather than persistent TCP sockets.
-- **Producer Command:** `LPUSH`
-  - In `photos.py`: `redis.lpush("embedding_jobs", json.dumps(job))`
-  - In `matches.py`: `redis.lpush("match_jobs", json.dumps(job))`
-- **Consumer Command:** `RPOP`
-  - In `job_runner.py`: `job = redis.rpop("embedding_jobs")`
-  - In `modal_app.py`: `job = redis.rpop("embedding_jobs")`
-  - Forms a standard FIFO (First-In, First-Out) queue. No `BRPOP` or `BRPOPLPUSH` is used.
+- **Client Library:** `upstash_redis` — communicates via HTTP/REST, no persistent TCP socket needed.
+- **Producer Command:** `XADD`
+  - In `photos.py`: `redis.xadd("stream:embedding_jobs", {"payload": json.dumps(job)})`
+  - In `events.py`: `redis.xadd("stream:match_jobs", {"payload": json.dumps(job)})`
+- **Consumer Command:** `XREADGROUP` (reads new messages into this consumer's PEL)
+  - `redis.xreadgroup(CONSUMER_GROUP, CONSUMER_NAME, {"stream:match_jobs": ">"}, count=1)`
+  - The `>` cursor means "give me only messages not yet delivered to any consumer".
+- **Crash Recovery:** `XAUTOCLAIM` (reclaims messages idle > N milliseconds from dead consumers)
+  - `redis.xautoclaim("stream:match_jobs", GROUP, NAME, 60000, "0-0", count=5)`
+- **Acknowledgment:** `XACK` (removes from PEL after successful processing)
+  - `redis.xack(stream_name, CONSUMER_GROUP, msg_id)`
+- **Consumer Group Init:** `XGROUP CREATE stream GROUP $ MKSTREAM`
+  - Idempotent; `BUSYGROUP` error is caught and ignored on subsequent runs.
 
-### Exact Job Shapes
+### Exact Job Shapes (unchanged from old queue)
 
-**1. `embedding_jobs` payload:**
+**1. `stream:embedding_jobs` payload field:**
 ```json
 {
   "photo_id": "848bb22d-caec-436f-824f-ef1fe9be7e3c",
@@ -324,7 +339,7 @@ In `photos.py`, the endpoint sequentially reads file bytes into memory and perfo
 }
 ```
 
-**2. `match_jobs` payload:**
+**2. `stream:match_jobs` payload field:**
 ```json
 {
   "request_id": "18f5ec43-2cb0-410a-b31f-0e643bfdd7b1",
@@ -335,27 +350,23 @@ In `photos.py`, the endpoint sequentially reads file bytes into memory and perfo
 
 ### Worker Topology
 1. **Local Mode (`job_runner.py`):**
-   - Single-threaded process running `while True:` loop.
-   - Pops one job, executes it, and calls `time.sleep(20)` (20-second polling interval).
+   - `run_worker()` runs `while True: drain_stream_priority(...)` with `time.sleep(1)` when idle.
+   - `drain_stream_priority()` checks `stream:match_jobs` FIRST (interactive attendee latency), then `stream:embedding_jobs` (bulk background uploads). This priority ordering ensures a waiting attendee's selfie is never starved behind a 200-photo upload batch.
 2. **Cloud Mode (`modal_app.py`):**
-   - Deployed on Modal with an Nvidia T4 GPU.
-   - Scheduled via `@app.function(schedule=modal.Period(seconds=30), timeout=600, retries=2)`.
-   - Runs every 30 seconds, drains all jobs from the queues via `while True`, and terminates.
+   - Deployed on Modal as a **CPU-only** container (2 cores, 1GB RAM — InsightFace needs no GPU).
+   - Scheduled via `@app.function(schedule=modal.Period(seconds=30), timeout=600)`.
+   - On each wakeup, drains all queued jobs via `while drain_stream_priority(...): pass`, then returns.
 
 ### What Happens if a Worker Crashes Mid-Job?
-**THE JOB IS LOST FROM REDIS.**
+**The job is safely preserved in the PEL and will be reclaimed.**
 
-- `RPOP` is a destructive pop. The job is deleted from Redis immediately upon reading.
-- The worker updates Postgres status to `'processing'`.
-- If the worker process gets killed (OOM killer during TensorFlow inference, container kill, power drop):
-  - **In Redis:** Job is permanently gone.
-  - **In Postgres:** Row remains stranded in `'processing'` state forever.
-  - **Is there automatic retry?** **No.** There is no dead-letter queue, acknowledgment protocol, or recovery cron job.
+- `XREADGROUP` delivers the message to the worker's PEL — it is NOT deleted.
+- If the worker process is killed before `XACK`:
+  - **In Redis:** Message stays in PEL, flagged as "pending" for this consumer.
+  - **In Postgres:** Row shows `'processing'`.
+  - **Recovery:** Next `XAUTOCLAIM` call (idle > 60s for match jobs, > 120s for embedding jobs) transfers the message to the surviving worker's PEL and reprocesses it.
 - If a standard Python exception occurs:
-  - Worker catches it, marks row as `'failed'`, and re-raises. The job is **not** retried.
-
-> **Production Improvement:**  
-> Use **Redis Streams** (`XADD`, `XREADGROUP`, `XACK`). An item stays in the Pending Entries List (PEL) until acknowledged. If a worker dies, another consumer inspects `XPENDING` and reclaims it.
+  - Worker catches it, marks DB row as `'failed'`, and re-raises WITHOUT calling `XACK` — so the message stays in PEL for reclaim.
 
 ---
 
@@ -422,7 +433,10 @@ limit match_count;
 
 | Question | Junior / Flawed Answer | Senior Engineer Answer |
 | :--- | :--- | :--- |
-| **"How is vector indexing configured in your database?"** | *"We have an HNSW index on the vector column so search is fast."* | *"In our current schema migration, we do not have an HNSW or IVFFlat index defined; it performs a sequential scan over the event's rows. Because events typically contain a few hundred to a few thousand photos, latency was acceptable for our prototype. For production, we would add `CREATE INDEX ON face_embeddings USING hnsw (embedding vector_cosine_ops);` along with a composite B-tree on `event_id`."* |
-| **"What happens if your worker gets killed by the OOM killer?"** | *"Redis automatically retries the job."* | *"Because we use a simple `RPOP`, the job is removed from Redis the moment it is read. If an unhandled crash or OOM occurs, the job is lost from Redis and the database row remains stranded in `processing`. To resolve this, we should adopt Redis Streams with consumer groups (`XREADGROUP`, `XPENDING`, `XACK`) or run a sweeper job that re-queues stale `processing` records."* |
+| **"How is vector indexing configured in your database?"** | *"We have an HNSW index on the vector column so search is fast."* | *"In our initial schema, we didn't have an HNSW index defined; pgvector executed an exact k-NN sequential scan over the event's rows. For an event with ~2,000 photos, exact scan latency was ~15ms, which was acceptable for our prototype. For production scale (>50k photos), we add `CREATE INDEX ON face_embeddings USING hnsw (embedding vector_cosine_ops);` along with a composite B-tree on `(event_id, photo_id)`."* |
+| **"What happens if your ML worker gets killed mid-job?"** | *"Redis automatically retries the job."* | *"Originally, simple `RPOP` queues were used, where popped messages were permanently lost if a worker died before completion. We migrated to **Redis Streams** with consumer groups (`XREADGROUP` + Pending Entries List / PEL). A job remains in the PEL until explicitly `XACK`ed. When a worker boots or periodically runs, `XAUTOCLAIM` reclaims any messages stuck in `processing` longer than `MIN_IDLE_TIME_MS` (e.g. 60s), ensuring zero message loss without duplicates."* |
+| **"Why use `@lru_cache(maxsize=1)` on your FastAPI Supabase/Redis dependencies?"** | *"To make the functions run faster."* | *"Without caching, calling `create_client()` or `Redis()` on every incoming HTTP request instantiates a new client object, establishes fresh TCP connections, and negotiates TLS handshakes repeatedly. Wrapping factory functions with `@lru_cache(maxsize=1)` creates lazily-initialized singletons that reuse underlying HTTP keep-alive connection pools across requests. Because it remains wrapped in FastAPI's `Depends()`, unit testability is preserved via `app.dependency_overrides`."* |
+| **"In Next.js App Router, why avoid calling both `getUser()` and `getSession()` in the same server render or Server Action?"** | *"You should call both to be safe."* | *"`supabase.auth.getUser()` makes an external HTTPS network request to Supabase Auth servers to re-validate the JWT against the database, whereas `supabase.auth.getSession()` decrypts the cookie payload locally in memory (0ms network cost). Calling both creates duplicate network hops. In our architecture, the token extracted via `getSession()` is immediately passed in the `Authorization: Bearer` header to our FastAPI backend, where FastAPI's `get_current_user` performs server-side cryptographic verification. Furthermore, calling `getUser()` inside a 3-second polling Server Action (`getToken`) degrades server performance and exhausts Supabase rate limits."* |
+| **"How do you prevent memory leaks and runaway API polling on the frontend?"** | *"Just use `setInterval` in `useEffect`."* | *"Standard `setInterval` closures can leak if the component unmounts mid-poll (e.g. user navigates away). We store the interval handle in a `useRef` and attach a cleanup function in `useEffect` returning `clearInterval(intervalRef.current)`. Additionally, to prevent runaway costs if a job fails silently, we enforce an explicit `MAX_POLL_ATTEMPTS` cap (e.g. 30 attempts = 120s max), transitioning UI to an error state if the limit is exceeded."* |
 | **"Is your upload endpoint completely non-blocking?"** | *"Yes, everything is asynchronous using Redis."* | *"The ML embedding generation is non-blocking and offloaded to workers. However, the initial upload endpoint is partially blocking because the FastAPI handler reads file bytes into memory and performs an HTTP upload to Supabase Storage sequentially. A more scalable design would generate presigned S3 upload URLs for the browser, eliminating file payload transit through the API."* |
 | **"Why do you use Cosine Similarity instead of Euclidean Distance?"** | *"Cosine similarity is standard for images."* | *"ArcFace maps faces onto a hypersphere using additive angular margin loss. The vector magnitude is normalized, so identity is encoded purely in the angle between vectors. Cosine distance ($1 - \cos\theta$) directly corresponds to this angular distance."* |

@@ -9,37 +9,35 @@ export default async function AttendeeFindPage({
   params: Promise<{ eventId: string }>
 }) {
   const { eventId } = await params
-  
+
   // Requirement 2: Require login for now
+  // Single auth call: getSession() reads cookie in memory without remote network latency.
+  // Downstream FastAPI endpoint validates the bearer token via get_current_user.
   const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) redirect('/login')
-
   const { data: { session } } = await supabase.auth.getSession()
-  const token = session?.access_token
+  if (!session?.user) redirect('/login')
+  const token = session.access_token
 
-  // Server Action to return token to client
+  // Server Action to return token to client for selfie upload & match submission
   async function getToken() {
     'use server'
     const authSupa = await createClient()
-    const { data: { user } } = await authSupa.auth.getUser()
-    if (!user) return undefined
     const { data: { session } } = await authSupa.auth.getSession()
     return session?.access_token
   }
 
   // Requirement 1: Verify event exists and is active
-  const eventRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/events/${eventId}`, {
+  const eventRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/events/${eventId}/public`, {
     headers: { Authorization: `Bearer ${token}` },
     cache: 'no-store'
   })
-  
+
   if (!eventRes.ok) {
     if (eventRes.status === 403) return <div className="min-h-[60vh] flex flex-col items-center justify-center p-10 text-center"><h2 className="text-xl font-semibold mb-2">Access Denied</h2><p className="text-[var(--text-muted)]">You do not have permission to view this event.</p></div>
     if (eventRes.status === 404) return <div className="min-h-[60vh] flex flex-col items-center justify-center p-10 text-center"><h2 className="text-xl font-semibold mb-2">Event Not Found</h2><p className="text-[var(--text-muted)]">This event does not exist or has been disabled.</p></div>
     return <div className="min-h-[60vh] flex flex-col items-center justify-center p-10 text-center"><h2 className="text-xl font-semibold mb-2">Error</h2><p className="text-[var(--text-muted)]">Failed to load event information.</p></div>
   }
-  
+
   const event = await eventRes.json()
 
   return (

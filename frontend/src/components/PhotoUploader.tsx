@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 
 /**
@@ -9,6 +9,10 @@ import { useRouter } from 'next/navigation'
  * This saves both the user's bandwidth and server resources. If a user accidentally selects a 50MB file or a PDF instead of an image, 
  * catching it instantly via client-side validation is a vastly superior UX compared to watching a long upload progress bar only to get an error at the end.
  */
+
+// Max number of poll ticks before we give up waiting for embedding to resolve.
+// 30 ticks × 4000ms = 120 seconds. After this, the user is asked to manually refresh.
+const MAX_POLL_ATTEMPTS = 30
 
 export default function PhotoUploader({ 
   eventId, 
@@ -22,6 +26,28 @@ export default function PhotoUploader({
   const [progress, setProgress] = useState<{ [key: string]: number }>({})
   const [error, setError] = useState<string | null>(null)
   const router = useRouter()
+
+  // Q: Why useRef instead of useState for the interval ID?
+  // A: We need to store the interval handle so we can cancel it later.
+  //    useState would cause a re-render every time we set it, which could
+  //    trigger the useEffect cleanup/re-run cycle unnecessarily.
+  //    useRef is a mutable box — React ignores changes to it, so storing
+  //    the interval ID there is a zero-side-effect operation.
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
+
+  // Q: Why useEffect for cleanup?
+  // A: useEffect's return function runs when the component unmounts.
+  //    Without this, if the user navigates away while polling is active,
+  //    the setInterval callback keeps firing — calling fetch() on a
+  //    component that no longer exists (React memory leak warning) and
+  //    making unnecessary network requests.
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current)
+      }
+    }
+  }, [])
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setError(null)
@@ -88,7 +114,21 @@ export default function PhotoUploader({
 
   const pollPhotos = (token: string) => {
     const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-    const interval = setInterval(async () => {
+    let attempts = 0
+
+    // Store the interval ID in the ref so our useEffect cleanup can cancel it on unmount
+    pollIntervalRef.current = setInterval(async () => {
+      attempts++
+
+      // Safety ceiling: stop polling after MAX_POLL_ATTEMPTS ticks.
+      // This prevents the interval running forever if a photo gets permanently stuck.
+      if (attempts >= MAX_POLL_ATTEMPTS) {
+        clearInterval(pollIntervalRef.current!)
+        pollIntervalRef.current = null
+        setError('Embedding is taking longer than expected. Please refresh the page to see the latest status.')
+        return
+      }
+
       try {
         const res = await fetch(`${apiUrl}/events/${eventId}/photos`, {
           headers: { 'Authorization': `Bearer ${token}` },
@@ -105,7 +145,8 @@ export default function PhotoUploader({
                 p.embedding_status === 'done' || p.embedding_status === 'failed'
             )
             if (allResolved) {
-              clearInterval(interval)
+              clearInterval(pollIntervalRef.current!)
+              pollIntervalRef.current = null
             }
           }
         }
@@ -189,3 +230,4 @@ export default function PhotoUploader({
     </div>
   )
 }
+

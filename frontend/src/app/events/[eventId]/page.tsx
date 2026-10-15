@@ -10,18 +10,21 @@ export default async function EventDetailsPage({
 }) {
   const { eventId } = await params
   const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) redirect('/login')
 
+  // Single auth call: getSession() extracts session and token from cookies in memory.
+  // We avoid calling both getUser() and getSession():
+  // 1. getUser() initiates an outbound HTTPS network request to Supabase Auth servers.
+  // 2. getSession() reads the session directly from cookies with 0ms network overhead.
+  // 3. FastAPI backend validates the bearer token on every request (via get_current_user).
   const { data: { session } } = await supabase.auth.getSession()
-  const token = session?.access_token
+  if (!session?.user) redirect('/login')
+  const token = session.access_token
 
-  // Server Action to return token to client
+  // Server Action to return token to client (e.g. for PhotoUploader upload & polling)
+  // Calling getSession() avoids making a network call to Supabase Auth on every poll tick.
   async function getToken() {
     'use server'
     const authSupa = await createClient()
-    const { data: { user } } = await authSupa.auth.getUser()
-    if (!user) return undefined
     const { data: { session } } = await authSupa.auth.getSession()
     return session?.access_token
   }
